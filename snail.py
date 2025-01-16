@@ -1,89 +1,109 @@
 # -*- coding: utf-8 -*-
 """
 Usage :
- > python snail.py -n 1200000
+ > python3 snail.py -n "Total sequential" -p "File Name" -ncore "Number of CPU To Use"
+ > python3 snail.py -n 8000000 -p Puzzles67-70.txt -ncore 8 
  
 @author: iceland
 """
-import secp256k1 as ice
-import time
-import os
-import sys
-import random
 import argparse
-
+import secp256k1 as ice
+import sys, os, time, datetime, secrets
+from multiprocessing import Event, Pool, Value, cpu_count, Manager
 #==============================================================================
 parser = argparse.ArgumentParser(description='This tool use random number reusability for sequentially searching all unsolved BTC puzzles', 
                                  epilog='Enjoy the program! :)    Tips BTC: bc1q39meky2mn5qjq704zz0nnkl0v7kj4uz6r529at')
-parser.version = '02052023'
-parser.add_argument("-p", help = "Unsolved Puzzles file. default=unsolved.txt", action="store")
-parser.add_argument("-n", help = "Total sequential search in 1 loop. default=1000000", action='store')
-
+parser.version = '02052024'  
+parser.add_argument('-n', type=int, default=1000000, action="store", help="Total sequential search in 1 loop. default=1000000")
+parser.add_argument('-p', type=str, default='unsolved.txt', action="store", help="Unsolved Puzzles file. default=unsolved.txt")
+parser.add_argument('-ncore', type=int, action="store", help="Number of CPU to use. default = Total-1")
 args = parser.parse_args()
 #==============================================================================
-
-seq = int(args.n) if args.n else 1000000  # 1 Million
+seq = args.n
+UsedCores = int(args.ncore) if args.ncore else cpu_count() -1
 p_file = args.p if args.p else 'unsolved.txt'  # 'unsolved.txt'
-
 if os.path.isfile(p_file) == False:
     print('File {} not found'.format(p_file))
     sys.exit()
 puzz = {int(line.split()[0]):line.split()[1] for line in open(p_file,'r')}
-puzz_bits = list(puzz.keys())
+PuzzBits = list(puzz.keys())
 puzz_h160 = [bytes.fromhex(ice.address_to_h160(line)) for line in puzz.values()]
 #==============================================================================
+def Generator(counter, match, queue, lock, Loops):
+    while not match.is_set():
+        Loops += 1
+        for bits in PuzzBits:
+            MIN = 2 ** (bits - 1)
+            MAX = 2 ** bits
+            keyInt = secrets.randbelow(MAX - MIN) + MIN
+            P = ice.scalar_multiplication(keyInt)
+            currentPvk = keyInt + 1
+            with lock:
+                counter.value += seq
+            Pv = ice.point_sequential_increment(seq, P)
+            foundInGroup = 0
+            startTimeSLoop = time.time()
 
-# Very Very Slow. Made only to get a random number completely non pseudo stl.
-def randk(bits):
-    return random.SystemRandom().randint(2**(bits-1), -1+2**bits)
-
-def print_success(my_key):
-    print('\n============== KEYFOUND ==============')
-    print(f'Puzzle FOUND PrivateKey: {hex(my_key)}   Address: {ice.privatekey_to_address(0, True, my_key)}')
-    print('======================================')
-    with open('KEYFOUNDKEYFOUND.txt','a') as fw:
-        fw.write('Puzzle_FOUND_PrivateKey '+hex(my_key)+'\n')
-    exit()
-    
-def chunks(s):
-    for start in range(0, 65*seq, 65):
-        yield s[start : start + 65]
-
-def display_time(seconds):
-    hours, rem = divmod(seconds, 3600)
-    minutes, seconds = divmod(rem, 60)
-    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:05.2f}"
-    
+            for t in range(seq):
+                h160 = ice.pubkey_to_h160(0, True, (Pv[t * 65:t * 65 + 65]))
+                if h160 in puzz_h160:
+                    match.set()
+                    queue.put_nowait((currentPvk + t, h160))
+                    foundInGroup += 1
+                    
+            ElapsedSL = time.time() - startTimeSLoop
+            with lock:
+                print(f'[Loop: {Loops}] [Puzzle: {bits} bit] [Speed: {seq / ElapsedSL:.2f} K/s] [Total: {'{:,}'.format(counter.value)}] [{ElapsedSL:,.2f} S ] [{hex(keyInt)}]', end='\r')
 #==============================================================================
+def Snail():
+    with Manager() as manager:
+        counter = manager.Value('L', 0)
+        match = manager.Event()
+        queue = manager.Queue()
+        lock = manager.Lock()
+        startTime = time.time()
+        Loops = 0 
+        with Pool(processes=UsedCores) as pool:
+            pool.starmap(Generator, [(counter, match, queue, lock, Loops) for _ in range(UsedCores)])
 
-print('\n[+] Starting Program.... Please Wait !')
-print(f'[+] Search Mode: Sequential Random in each Loop. seq={seq}')
-print(f'[+] Total Unsolved: {len(puzz_bits)} Puzzles in the bit range [{min(puzz_bits)}-{max(puzz_bits)}]')
+        totalGenerated = counter.value
+        totalFound = 0
 
-loop = 0
-start = time.time()
-while True:
+        while not queue.empty():
+            privateKey, h160 = queue.get()
+            totalFound += 1
+            
+            print(f"\n============== KEYFOUND ==============")        
+            print(f"Puzzle FOUND PrivateKey: {hex(privateKey)}")
+            wifKey = ice.btc_pvk_to_wif(privateKey, False)
+            puzadd = ice.privatekey_to_address(0, True, privateKey)
+            print(f"Private Key(wif): {wifKey}\nPuzzle Address: {puzadd}\nH160: {h160.hex()}")
+            print(f"======================================")
+
+            with open('KEYFOUNDKEYFOUND.txt', 'a') as fw:
+                fw.write(f"H160           :{h160.hex()}\n"
+                        f"Puzzle Address :{puzadd}\n"
+                        f"WIF            :{wifKey}\n"
+                        f"PK             :{privateKey}\n"
+                        f"PK HEX         :{hex(privateKey)}\n"
+                        f"====================================================================\n")
+
+        executionTime = time.time() - startTime
+        print(f"Total Generated: {'{:,}'.format(totalGenerated)}, Total Found: {totalFound}")
+        print(f"Execution Time: {executionTime:.2f} seconds")
+        
+#==============================================================================
+if __name__ == '__main__':
+    startTime = datetime.datetime.now()
+    print('\n[+] Starting Program.... Please Wait !')
+    print(f'[+] Search Mode: Sequential Random in each Loop. seq={seq}')
+    print(f'[+] Total Unsolved: {len(PuzzBits)} Puzzles in the bit range [{min(PuzzBits)}-{max(PuzzBits)}]')
+
     try:
-        key_int = randk(160)
-        loop += 1
-        counter = 0
-        for cbits in puzz_bits:
-            counter += 1
-            bitkey = int('1'+bin(key_int)[2:][(1+160-cbits):], 2)
-            P = ice.scalar_multiplication(bitkey)
-            if ice.pubkey_to_h160(0, True, P) in puzz_h160: 
-                print_success(bitkey)
-                
-            cnt = 0
-            for t in chunks(ice.point_sequential_increment(seq, P)):
-                curr160 = ice.pubkey_to_h160(0, True, t)
-                if curr160 in puzz_h160:
-                    print_success(bitkey + cnt + 1)
-
-                cnt += 1
-            elapsed = time.time() - start
-            speed = ( (loop-1)*(seq+1)*len(puzz_bits) + (seq+1)*counter ) / elapsed
-            print(' '*120,end='\r')
-            print(f'[Loop: {loop}] [Puzzle: {cbits} bit] [Speed: {speed:.2f} K/s] [{display_time(elapsed)}] [{hex(bitkey)}]', end='\r')
-    except(KeyboardInterrupt, SystemExit):
-        exit('\nSIGINT or CTRL-C detected. Exiting gracefully. BYE')
+        Snail()
+    except (KeyboardInterrupt, SystemExit):
+        print('\nSIGINT or CTRL-C detected. Exiting gracefully. BYE')
+        match.set()  
+        
+    finally:
+        print(f"Overall Execution Time: {datetime.datetime.now() - startTime}")
